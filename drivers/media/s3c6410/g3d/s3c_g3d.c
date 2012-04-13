@@ -1,8 +1,7 @@
-/* g3d/s3c-g3d.c
+/*
+ * OpenFIMG Kernel Interface
  *
- * Copyright (c) 2010 Tomasz Figa <tomasz.figa at gmail.com>
- *
- * Samsung S3C G3D driver
+ * Copyright 2010-2011 Tomasz Figa <tomasz.figa at gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,6 +18,7 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
+#include <linux/slab.h>
 #include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
@@ -34,6 +34,7 @@
 #include <linux/sched.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
+#include <linux/pm_runtime.h>
 
 #include <mach/hardware.h>
 #include <mach/map.h>
@@ -43,25 +44,22 @@
 #include <plat/reserved_mem.h>
 
 #include "s3c_g3d.h"
+/*
+ * Various definitions
+ */
+#define G3D_AUTOSUSPEND_DELAY		(1000)
+#define G3D_TIMEOUT			(1*HZ)
 
-#ifdef CONFIG_S3C64XX_DOMAIN_GATING
-#define USE_G3D_DOMAIN_GATING
-#endif
-
-/* Driver information */
-#define DRIVER_DESC		"S3C G3D Device Driver"
-#define DRIVER_NAME		"s3c-g3d"
-
-/* Various definitions */
-#define G3D_MINOR  		249
-#define G3D_SFR_BASE		0x72000000
-#define G3D_SFR_SIZE		0x80000
-#define G3D_IDLE_TIME_SECS	10
-#define G3D_TIMEOUT		1000
-
-/* Registers */
+/*
+ * Registers
+ */
 #define G3D_FGGB_PIPESTAT_REG		(0x00)
+#define G3D_FGGB_PIPESTAT_MSK		(0x0005171f)
+
 #define G3D_FGGB_CACHECTL_REG		(0x04)
+#define G3D_FGGB_FLUSH_MSK		(0x00000033)
+#define G3D_FGGB_INVAL_MSK		(0x00001300)
+
 #define G3D_FGGB_RESET_REG		(0x08)
 #define G3D_FGGB_VERSION		(0x10)
 #define G3D_FGGB_INTPENDING_REG		(0x40)
@@ -69,58 +67,67 @@
 #define G3D_FGGB_PIPEMASK_REG		(0x48)
 #define G3D_FGGB_PIPETGTSTATE_REG	(0x4c)
 
-/* Valid bits of FGGB_PIPESTAT */
-#define G3D_FGGB_PIPESTAT_MSK	(0x0005171f)
-#define G3D_FGGB_FLUSH_MSK	(0x00000033)
-#define G3D_FGGB_INVAL_MSK	(0x00001300)
-
+/*
+ * Private structures
+ */
 struct g3d_context;
 
-/* Driver data (shared) */
 struct g3d_drvdata {
-	void __iomem		*base;	// registers base address
+	void __iomem		*base;
 
 	uint32_t		mask;
-	struct mutex		lock;	// mutex
-	struct mutex		hw_lock; 
-	struct g3d_context	*owner; // current context
-	struct completion	completion; // completion
+	struct mutex		lock;
+	struct mutex		hw_lock;
+	struct g3d_context	*hw_owner;
+	struct completion	completion;
 
-	int			irq;	// interrupt number
-	struct resource 	*mem;	// memory resource
-	struct clk		*clock;	// device clock
+	int			irq;
+	struct resource 	*mem;
+	struct clk		*clock;
 	struct device		*dev;
-
-#ifdef USE_G3D_DOMAIN_GATING
-	struct hrtimer		timer;	// idle timer
-	int			state;	// power state
-#endif
+	struct miscdevice	mdev;
 };
-struct g3d_drvdata	*drvdata;
+
 struct g3d_context {
 	struct g3d_drvdata	*data;
 	/* More to come */
 };
 
-/* Logging */
-//#define G3D_DEBUG
-#ifdef G3D_DEBUG
-#define DBG(format, args...) \
-	printk(KERN_DEBUG "%s: " format, DRIVER_NAME, ## args)
-#else
-#define DBG(format, args...)
-#endif
-#define ERR(format, args...) \
-	printk(KERN_ERR "%s: " format, DRIVER_NAME, ## args)
-#define WARNING(format, args...) \
-	printk(KERN_WARNING "%s: " format, DRIVER_NAME, ## args)
-#define INFO(format, args...) \
-	printk(KERN_INFO "%s: " format, DRIVER_NAME, ## args)
+#define DOMAIN_POWER_ON do { \
+	s3c_set_normal_cfg(S3C64XX_DOMAIN_G, S3C64XX_ACTIVE_MODE, S3C64XX_3D); \
+	if(s3c_wait_blk_pwr_ready(S3C64XX_BLK_G)) { \
+		return -1; \
+	} \
+} while (0)
 
+#define DOMAIN_POWER_OFF do { \
+	s3c_set_normal_cfg(S3C64XX_DOMAIN_G, S3C64XX_LP_MODE, S3C64XX_3D); \
+} while (0)
+
+static int g3d_pm_flag = 0;
+static inline void clk_g3d_enable(struct g3d_drvdata *data)
+{
+	if (g3d_pm_flag > 0) {
+		g3d_pm_flag++;
+		return;
+	}
+
+	clk_enable(data->clock);
+	g3d_pm_flag++;
+}
+
+static inline void clk_g3d_disable(struct g3d_drvdata *data)
+{
+	if (g3d_pm_flag <= 0) {
+		return;
+	}
+
+	g3d_pm_flag--;
+	clk_disable(data->clock);
+}
 /*
-	Register accessors
-*/
-
+ * Register accessors
+ */
 static inline void g3d_write(struct g3d_drvdata *d, uint32_t b, uint32_t r)
 {
 	writel(b, d->base + r);
@@ -132,9 +139,8 @@ static inline uint32_t g3d_read(struct g3d_drvdata *d, uint32_t r)
 }
 
 /*
-	Hardware operations
-*/
-
+ * Hardware operations
+ */
 static inline void g3d_soft_reset(struct g3d_drvdata *data)
 {
 	g3d_write(data, 1, G3D_FGGB_RESET_REG);
@@ -142,7 +148,7 @@ static inline void g3d_soft_reset(struct g3d_drvdata *data)
 	g3d_write(data, 0, G3D_FGGB_RESET_REG);
 }
 
-static inline int g3d_flush(struct g3d_drvdata *data, unsigned int mask)
+static inline int g3d_flush_pipeline(struct g3d_drvdata *data, unsigned int mask)
 {
 	int ret = 0;
 
@@ -165,8 +171,9 @@ static inline int g3d_flush(struct g3d_drvdata *data, unsigned int mask)
 	}
 
 	if(!wait_for_completion_interruptible_timeout(&data->completion,
-							G3D_TIMEOUT)) {
-		ERR("Timeout while waiting for interrupt, resetting\n");
+								G3D_TIMEOUT)) {
+		dev_err(data->dev, "timeout while waiting for interrupt, resetting (stat=%08x)\n",
+					g3d_read(data, G3D_FGGB_PIPESTAT_REG));
 		g3d_soft_reset(data);
 		ret = -EFAULT;
 	}
@@ -200,9 +207,8 @@ static inline void g3d_invalidate_caches(struct g3d_drvdata *data)
 }
 
 /*
-	State processing
-*/
-
+ * State processing
+ */
 static irqreturn_t g3d_handle_irq(int irq, void *dev_id)
 {
 	struct g3d_drvdata *data = (struct g3d_drvdata *)dev_id;
@@ -221,77 +227,9 @@ static inline int ctx_has_lock(struct g3d_context *ctx)
 {
 	struct g3d_drvdata *data = ctx->data;
 
-	return mutex_is_locked(&data->hw_lock) && (data->owner == ctx);
+	return mutex_is_locked(&data->hw_lock) && (data->hw_owner == ctx);
 }
 
-/*
-	Power management
-*/
-
-static inline int g3d_do_power_up(struct g3d_drvdata *data)
-{
-#ifdef CONFIG_S3C64XX_DOMAIN_GATING
-	s3c_set_normal_cfg(S3C64XX_DOMAIN_G, S3C64XX_ACTIVE_MODE, S3C64XX_3D);
-
-	if (s3c_wait_blk_pwr_ready(S3C64XX_BLK_G)) {
-		return -1;
-	}
-#endif
-	clk_enable(data->clock);
-	g3d_soft_reset(data);
-
-	return 1;
-}
-
-static inline void g3d_do_power_down(struct g3d_drvdata *data)
-{
-	clk_disable(data->clock);
-#ifdef CONFIG_S3C64XX_DOMAIN_GATING
-	s3c_set_normal_cfg(S3C64XX_DOMAIN_G, S3C64XX_LP_MODE, S3C64XX_3D);
-#endif
-	data->owner = NULL;
-}
-
-#ifdef USE_G3D_DOMAIN_GATING
-/* Called with mutex locked */
-static inline int g3d_power_up(struct g3d_drvdata *data)
-{
-	int ret;
-
-	if (data->state)
-		return 0;
-
-	INFO("Requesting power up.\n");
-	if((ret = g3d_do_power_up(data)) > 0)
-		data->state = 1;
-
-	return ret;
-}
-
-/* Called with mutex locked */
-static inline void g3d_power_down(struct g3d_drvdata *data)
-{
-	if(!data->state)
-		return;
-
-	INFO("Requesting power down.\n");
-
-	g3d_flush(data, G3D_FGGB_PIPESTAT_MSK);
-	g3d_flush_caches(data);
-	g3d_do_power_down(data);
-	data->state = 0;
-}
-
-/* Called with mutex locked */
-static enum hrtimer_restart g3d_idle_func(struct hrtimer *t)
-{
-	struct g3d_drvdata *data = container_of(t, struct g3d_drvdata, timer);
-
-	g3d_power_down(data);
-
-	return HRTIMER_NORESTART;
-}
-#endif
 /*
  * File operations
  */
@@ -304,19 +242,15 @@ static int s3c_g3d_unlock(struct g3d_context *ctx)
 
 	if (unlikely(!ctx_has_lock(ctx))) {
 		dev_err(data->dev, "called S3C_G3D_UNLOCK without holding the hardware lock\n");
-		ret = -EPERM;
-		goto exit;
+		mutex_unlock(&data->lock);
+		return -EPERM;
 	}
 
-#ifdef USE_G3D_DOMAIN_GATING
-	hrtimer_start(&data->timer, ktime_set(G3D_IDLE_TIME_SECS, 0), HRTIMER_MODE_REL);
-#endif /* USE_G3D_DOMAIN_GATING */
+	mutex_unlock(&data->lock);
+
+	dev_dbg(data->dev, "hardware lock released by %p\n", ctx);
 
 	mutex_unlock(&data->hw_lock);
-	dev_dbg(data->dev, "hardware lock released by %p\n", ctx);
-	
-exit:
-	mutex_unlock(&data->lock);
 
 	return ret;
 }
@@ -332,30 +266,25 @@ static int s3c_g3d_lock(struct g3d_context *ctx)
 
 	mutex_lock(&data->lock);
 
-#ifdef USE_G3D_DOMAIN_GATING
-	if(!hrtimer_cancel(&data->timer)) {
-		ret = g3d_power_up(data);
-		if (ret < 0) {
-			dev_err(data->dev, "Timeout while waiting for G3D power up\n");
-			mutex_unlock(&data->hw_lock);
-			goto exit;
-		}
+	if (unlikely(ret < 0)) {
+		dev_err(data->dev, "runtime resume failed.\n");
+		mutex_unlock(&data->hw_lock);
+		goto exit;
 	}
-#endif /* USE_G3D_DOMAIN_GATING */
 
-	if (likely(data->owner == ctx)) {
+	if (likely(data->hw_owner == ctx)) {
 		mutex_unlock(&data->lock);
 		return 0;
 	}
 
 	ret = 1;
 
-	if (data->owner) {
-		g3d_flush(data, G3D_FGGB_PIPESTAT_MSK);
+	if (data->hw_owner) {
+		g3d_flush_pipeline(data, G3D_FGGB_PIPESTAT_MSK);
 		ret = 2;
 	}
 
-	data->owner = ctx;
+	data->hw_owner = ctx;
 
 exit:
 	mutex_unlock(&data->lock);
@@ -376,19 +305,16 @@ static int s3c_g3d_flush(struct g3d_context *ctx, u32 mask)
 		goto exit;
 	}
 
-	ret = g3d_flush(data, mask & G3D_FGGB_PIPESTAT_MSK);
+	ret = g3d_flush_pipeline(data, mask & G3D_FGGB_PIPESTAT_MSK);
 
 exit:
 	mutex_unlock(&data->lock);
 
 	return ret;
 }
-/*
-	File operations
-*/
 
-static int s3c_g3d_ioctl(struct inode *inode, struct file *file,
-				unsigned int cmd, unsigned long arg)
+static long s3c_g3d_ioctl(struct file *file,
+					unsigned int cmd, unsigned long arg)
 {
 	struct g3d_context *ctx = file->private_data;
 	int ret = 0;
@@ -418,11 +344,16 @@ static int s3c_g3d_ioctl(struct inode *inode, struct file *file,
 
 static int s3c_g3d_open(struct inode *inode, struct file *file)
 {
-	struct g3d_context *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+	struct miscdevice *mdev = file->private_data;
+	struct g3d_drvdata *data = container_of(mdev, struct g3d_drvdata, mdev);
+	struct g3d_context *ctx;
 
-	ctx->data = drvdata;
+	ctx = kmalloc(sizeof(struct g3d_context), GFP_KERNEL);
+	ctx->data = data;
+
 	file->private_data = ctx;
-	DBG("device opened\n");
+
+	dev_dbg(data->dev, "device opened\n");
 
 	return 0;
 }
@@ -431,105 +362,115 @@ static int s3c_g3d_release(struct inode *inode, struct file *file)
 {
 	struct g3d_context *ctx = file->private_data;
 	struct g3d_drvdata *data = ctx->data;
-	unsigned long flags;
 	int unlock = 0;
 
 	/* Do this atomically */
-	local_irq_save(flags);
-	if(mutex_is_locked(&data->lock) && data->owner == ctx)
-		unlock = 1;
-	local_irq_restore(flags);
+	mutex_lock(&data->lock);
+
+	unlock = ctx_has_lock(ctx);
+
+	mutex_unlock(&data->lock);
 
 	/* Unlock if we have the lock */
 	if(unlock)
-		s3c_g3d_ioctl(inode, file, S3C_G3D_UNLOCK, 0);
+		s3c_g3d_ioctl(file, S3C_G3D_UNLOCK, 0);
 
 	kfree(ctx);
-	DBG("device released\n");
+	dev_dbg(data->dev, "device released\n");
 
 	return 0;
 }
 
 int s3c_g3d_mmap(struct file* file, struct vm_area_struct *vma)
 {
+	struct g3d_context *ctx = file->private_data;
+	struct g3d_drvdata *data = ctx->data;
 	unsigned long pfn;
 	size_t size = vma->vm_end - vma->vm_start;
 
-	pfn = __phys_to_pfn(G3D_SFR_BASE);
+	pfn = __phys_to_pfn(data->mem->start);
 
-	if(size > G3D_SFR_SIZE) {
-		ERR("mmap size bigger than G3D SFR block\n");
+	if(size > resource_size(data->mem)) {
+		dev_err(data->dev, "mmap size bigger than G3D SFR block\n");
 		return -EINVAL;
 	}
 
 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 
 	if ((vma->vm_flags & VM_WRITE) && !(vma->vm_flags & VM_SHARED)) {
-		ERR("mmap of G3D SFR block must be shared\n");
+		dev_err(data->dev, "mmap of G3D SFR block must be shared\n");
 		return -EINVAL;
 	}
 
 	if (remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot)) {
-		ERR("remap_pfn range failed\n");
+		dev_err(data->dev, "remap_pfn range failed\n");
 		return -EINVAL;
 	}
 
-	DBG("Hardware mapped by %p\n", ctx);
+	dev_dbg(data->dev, "hardware mapped by %p\n", ctx);
 
 	return 0;
 }
 
 static struct file_operations s3c_g3d_fops = {
-	.owner 	= THIS_MODULE,
-	.ioctl 	= s3c_g3d_ioctl,
-	.open 	= s3c_g3d_open,
-	.release = s3c_g3d_release,
-	.mmap	= s3c_g3d_mmap,
-};
-
-static struct miscdevice s3c_g3d_dev = {
-	.minor		= G3D_MINOR,
-	.name		= DRIVER_NAME,
-	.fops		= &s3c_g3d_fops,
+	.owner		= THIS_MODULE,
+	.unlocked_ioctl	= s3c_g3d_ioctl,
+	.open		= s3c_g3d_open,
+	.release	= s3c_g3d_release,
+	.mmap		= s3c_g3d_mmap,
 };
 
 /*
-	Platform device operations
-*/
-
-int s3c_g3d_probe(struct platform_device *pdev)
+ * Platform device operations
+ */
+static int __init s3c_g3d_probe(struct platform_device *pdev)
 {
 	struct resource *res;
 	struct g3d_drvdata *data;
 	int ret;
 	uint32_t version;
 
+	if (pdev->id != -1) {
+		dev_err(&pdev->dev, "only single instance is allowed.\n");
+		return -EINVAL;
+	}
+
 	data = kzalloc(sizeof(struct g3d_drvdata), GFP_KERNEL);
 	if(data == NULL) {
-		ERR("failed to allocate driver data.\n");
+		dev_err(&pdev->dev, "failed to allocate driver data.\n");
 		return -ENOMEM;
 	}
 
+	/* initialize the miscdevice struct */
+	data->mdev.minor	= MISC_DYNAMIC_MINOR;
+	data->mdev.name		= "s3c-g3d";
+	data->mdev.fops		= &s3c_g3d_fops;
+
+	DOMAIN_POWER_ON;
+
+	/* get device clock */
 	data->clock = clk_get(&pdev->dev, "hclk_g3d");
 	if (data->clock == NULL) {
-		ERR("failed to find g3d clock source\n");
+		dev_err(&pdev->dev, "failed to find g3d clock source\n");
 		ret = -ENOENT;
 		goto err_clock;
 	}
 
+	clk_g3d_enable(data);
+
 	/* get the memory region for the post processor driver */
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if(res == NULL) {
-		ERR("failed to get memory region resource.\n");
+		dev_err(&pdev->dev, "failed to get memory region resource.\n");
 		ret = -ENOENT;
 		goto err_mem;
 	}
-
+	
 	/* reserve the memory */
 	data->mem = request_mem_region(res->start, resource_size(res),
 								pdev->name);
 	if (data->mem == NULL) {
-		ERR("failed to reserve memory region\n");
+		dev_err(&pdev->dev, "failed to reserve memory region\n");
 		ret = -ENOENT;
 		goto err_mem;
 	}
@@ -537,7 +478,7 @@ int s3c_g3d_probe(struct platform_device *pdev)
 	/* map the memory */
 	data->base = ioremap(data->mem->start, resource_size(data->mem));
 	if (data->base == NULL) {
-		ERR("ioremap failed\n");
+		dev_err(&pdev->dev, "ioremap failed\n");
 		ret = -ENOENT;
 		goto err_ioremap;
 	}
@@ -545,7 +486,8 @@ int s3c_g3d_probe(struct platform_device *pdev)
 	/* get the IRQ */
 	data->irq = platform_get_irq(pdev, 0);
 	if (data->irq <= 0) {
-		ERR("failed to get irq resource (%d).\n", data->irq);
+		dev_err(&pdev->dev,
+			"failed to get irq resource (%d).\n", data->irq);
 		ret = data->irq;
 		goto err_irq;
 	}
@@ -553,63 +495,40 @@ int s3c_g3d_probe(struct platform_device *pdev)
 	/* request the IRQ */
 	ret = request_irq(data->irq, g3d_handle_irq, 0, pdev->name, data);
 	if (ret) {
-		ERR("request_irq failed (%d).\n", ret);
+		dev_err(&pdev->dev, "request_irq failed (%d).\n", ret);
 		goto err_irq;
 	}
 
-	data->owner = NULL;
+	data->dev = &pdev->dev;
+	data->hw_owner = NULL;
 	mutex_init(&data->lock);
 	mutex_init(&data->hw_lock);
 	init_completion(&data->completion);
 
-#ifdef USE_G3D_DOMAIN_GATING
-	hrtimer_init(&data->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	data->timer.function = g3d_idle_func;
-	data->state = 1;
-#endif
-	if(g3d_do_power_up(data) < 0) {
-		ERR("G3D power up failed\n");
-		ret = -EFAULT;
-		goto err_pm;
-	}
+	platform_set_drvdata(pdev, data);
+
+	g3d_soft_reset(data);
 
 	version = g3d_read(data, G3D_FGGB_VERSION);
-	INFO("detected FIMG-3DSE version %d.%d.%d\n", version >> 24,
-				(version >> 16) & 0xff, (version >> 8) & 0xff);
+	dev_info(&pdev->dev, "detected FIMG-3DSE version %d.%d.%d\n",
+		version >> 24, (version >> 16) & 0xff, (version >> 8) & 0xff);
 
-	platform_set_drvdata(pdev, data);
-	drvdata = data;
-
-	ret = misc_register(&s3c_g3d_dev);
+	ret = misc_register(&data->mdev);
 	if (ret < 0) {
-		ERR("could not register miscdev on minor=%d (%d)\n",
-							G3D_MINOR, ret);
+		dev_err(&pdev->dev, "could not register miscdev (%d)\n", ret);
 		goto err_misc_register;
 	}
-
-#ifdef USE_G3D_DOMAIN_GATING
-	hrtimer_start(&data->timer, ktime_set(G3D_IDLE_TIME_SECS, 0),
-							HRTIMER_MODE_REL);
-#endif
-	INFO("Driver loaded succesfully\n");
 
 	return 0;
 
 err_misc_register:
-#ifndef USE_G3D_DOMAIN_GATING
-	g3d_do_power_down(data);
-#else
-	if(!hrtimer_cancel(&data->timer))
-		g3d_power_down(data);
-#endif
-	free_irq(data->irq, pdev);
-err_pm:
 	free_irq(data->irq, pdev);
 err_irq:
 	iounmap(data->base);
 err_ioremap:
-        release_resource(data->mem);
+	release_resource(data->mem);
 err_mem:
+	clk_g3d_enable(data);
 	clk_put(data->clock);
 err_clock:
 	kfree(data);
@@ -617,112 +536,100 @@ err_clock:
 	return ret;
 }
 
-static int s3c_g3d_remove(struct platform_device *pdev)
+static int __devexit s3c_g3d_remove(struct platform_device *pdev)
 {
 	struct g3d_drvdata *data = platform_get_drvdata(pdev);
 
-#ifdef USE_G3D_DOMAIN_GATING
-	if(!hrtimer_cancel(&data->timer))
-		g3d_power_down(data);
-#else
-	g3d_flush(data, G3D_FGGB_PIPESTAT_MSK);
-	g3d_flush_caches(data);
-	g3d_do_power_down(data);
-#endif
-
-	misc_deregister(&s3c_g3d_dev);
+	misc_deregister(&data->mdev);
 
 	free_irq(data->irq, data);
 	iounmap(data->base);
 	release_resource(data->mem);
+	clk_g3d_disable(data);	
+	clk_put(data->clock);
 	kfree(data);
-
-	INFO("Driver unloaded succesfully.\n");
 
 	return 0;
 }
 
-static int s3c_g3d_suspend(struct platform_device *pdev, pm_message_t state)
+static int s3c_g3d_runtime_suspend(struct device *dev)
 {
-	struct g3d_drvdata *data = dev_get_drvdata(&pdev->dev);
+	struct g3d_drvdata *data = dev_get_drvdata(dev);
 
-#ifdef USE_G3D_DOMAIN_GATING
-	if(hrtimer_cancel(&data->timer))
-		g3d_power_down(data);
-#else
-	g3d_flush(data, G3D_FGGB_PIPESTAT_MSK);
-	g3d_flush_caches(data);
-	g3d_do_power_down(data);
-#endif
+	clk_disable(data->clock);
+	data->hw_owner = NULL;
 
-	if (mutex_is_locked(&data->lock)) {
-		dev_err(data->dev, "suspend requested with locked hardware (broken userspace?)\n");
+	return 0;
+}
+
+static int s3c_g3d_runtime_resume(struct device *dev)
+{
+	struct g3d_drvdata *data = dev_get_drvdata(dev);
+
+	clk_enable(data->clock);
+	g3d_soft_reset(data);
+
+	return 0;
+}
+
+static int s3c_g3d_suspend(struct device *dev)
+{
+	struct g3d_drvdata *data = dev_get_drvdata(dev);
+
+	if (mutex_is_locked(&data->hw_lock)) {
+		dev_err(dev, "suspend requested with locked hardware (broken userspace?)\n");
 		return -EAGAIN;
 	}
 
-	data->owner = NULL;
+	clk_disable(data->clock);
+	data->hw_owner = NULL;
+
 	return 0;
 }
 
-static int s3c_g3d_resume(struct platform_device *pdev)
+static int s3c_g3d_resume(struct device *dev)
 {
-	struct g3d_drvdata *data = dev_get_drvdata(&pdev->dev);
+	struct g3d_drvdata *data = dev_get_drvdata(dev);
 
-#ifndef USE_G3D_DOMAIN_GATING
-	
-	g3d_do_power_up(data);
-
-	if(g3d_do_power_up(data) < 0) {
-		ERR("G3D power up failed\n");
-		return -EFAULT;
-	}
-#endif
 	clk_enable(data->clock);
 	g3d_soft_reset(data);
-	
 
 	return 0;
 }
 
+static struct dev_pm_ops s3c_g3d_pm_ops = {
+	.suspend		= s3c_g3d_suspend,
+	.resume			= s3c_g3d_resume,
+	.runtime_suspend	= s3c_g3d_runtime_suspend,
+	.runtime_resume		= s3c_g3d_runtime_resume,
+};
+
 static struct platform_driver s3c_g3d_driver = {
-	.probe          = s3c_g3d_probe,
-	.remove         = s3c_g3d_remove,
-	.suspend        = s3c_g3d_suspend,
-	.resume         = s3c_g3d_resume,
-	.driver		= {
+	.remove	= __devexit_p(s3c_g3d_remove),
+	.driver	= {
 		.owner	= THIS_MODULE,
-		.name	= DRIVER_NAME,
+		.name	= "s3c-g3d",
+		.pm	= &s3c_g3d_pm_ops,
 	},
 };
 
 /*
-	Module operations
-*/
-
+ * Module operations
+ */
 int __init  s3c_g3d_init(void)
 {
-	int ret;
-
-	if ((ret = platform_driver_register(&s3c_g3d_driver)) != 0) {
-		ERR("Platform device register failed (%d).\n", ret);
-		return ret;
-	}
-
-	INFO("Module initialized.\n");
-
-	return 0;
+	return platform_driver_probe(&s3c_g3d_driver, s3c_g3d_probe);
 }
 
-void  s3c_g3d_exit(void)
+void __exit s3c_g3d_exit(void)
 {
 	platform_driver_unregister(&s3c_g3d_driver);
-
-	INFO("Module exited.\n");
 }
 
 module_init(s3c_g3d_init);
 module_exit(s3c_g3d_exit);
 
 MODULE_AUTHOR("Tomasz Figa <tomasz.figa@gmail.com>");
-MODULE_DESCRIPTION("S3C G3D Device Driver");
+MODULE_DESCRIPTION("OpenFIMG Kernel Interface");
 MODULE_LICENSE("GPL");
+
